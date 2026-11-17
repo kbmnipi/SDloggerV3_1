@@ -1,0 +1,67 @@
+# =====================
+# PlatformIO
+# =====================
+.pio
+.pioenvs
+.piolib
+CMakeListsPrivate.txt
+cmake-build-*/
+
+# =====================
+# VS Code
+# =====================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# =====================
+# Компиляция / прошивка
+# =====================
+*.bin
+*.elf
+*.hex
+*.map
+*.o
+*.d
+*.a
+*.ld
+
+# =====================
+# Логи, данные, дампы
+# =====================
+*.log
+*.csv
+*.dat
+data/
+logs/
+*.bak
+*.tmp
+
+# =====================
+# Секреты / локальная конфигурация
+# =====================
+*.env
+.env
+secrets*.h
+*_local.h
+sdkconfig.local
+
+# =====================
+# Windows
+# =====================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# =====================
+# macOS / Linux
+# =====================
+.DS_Store
+._*
+.directory
+*.swp
+*~
