@@ -344,9 +344,14 @@ int main(void)
      *        answer" — the sensor never recognises the command and stays
      *        tri-stated, which reads as 0xFF on a pulled-up MISO.
      *     2) The interface is selected by CS itself: [DS §5] — "CS high = I2C
-     *        enabled / SPI idle, CS low = SPI active" — and the CS pull-up that
-     *        §2.1 lists as a MANDATORY M0 item is not fitted on this bench, so
-     *        the first CS-low edge can be consumed by the mode switch itself.
+     *        enabled / SPI idle, CS low = SPI active" — so the first CS-low
+     *        edge can be consumed by the interface-mode switch itself. The
+     *        47 kΩ CS pull-up (§2.1's MANDATORY M0 item) IS now fitted, and the
+     *        re-test with it in place returned the same log (0xFF, then 0x3F,
+     *        s_spi_err_cnt = 0): the pull-up removes the floating-CS risk, it
+     *        does not remove the throwaway first frame — finding BF-1,
+     *        Docs/90-DECISIONS-LOG.md — so the 3-attempt budget below stays and
+     *        is independent of the pull-up.
      *   One miss is therefore not evidence of an absent part. One 0x3F, however,
      *   IS a positive identification: no amount of retrying can invent 0x3F on a
      *   bus that is genuinely dead, because every attempt then reads the same

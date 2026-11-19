@@ -387,6 +387,15 @@ armed) and the §3.2.7 liveness poll are **not** relaxed: they run against an in
 part. (c) **Open follow-up (bench, next M0 pass):** re-run the gate with the CS pull-up fitted to
 record whether attempt 1 now answers — this changes the observed attempt number, not the rule.
 
+**Re-test with fitted CS pull-up — 2026-11-19 (UTC).** *(closes the open follow-up (c) above; the
+original BF-1 text above it is unchanged.)*
+
+| Item | Result |
+|------|--------|
+| **Fact** | With the **47 kΩ pull-up on CS (PA4) fitted**, the presence gate was re-run on the same bench and gave the **identical** attempt log: **attempt 1 → `0xFF`** (frame 1 answered nothing), **attempt 2 → `0x3F`**, and **`s_spi_err_cnt = 0`** — no timeout, no `OVR`, no `MODF` |
+| **Interpretation** | The pull-up **does not change the first-frame behaviour**. That rules out floating CS as the cause and confirms the mechanism is **intrinsic to the part at power-up**: the first falling CS edge is the interface-mode transition itself ([DS §5, `Docs/DS_lis3dsh.md:249`, and the pin table `:117` — `CS` high = I²C enabled / SPI idle, `CS` low = SPI active), and the frame that carries it can be lost. The **throwaway-first-frame rule is therefore mandatory regardless of the pull-up** |
+| **Note** | The **47 kΩ pull-up closes the §2.1 M0 "CS external pull-up" item** and guards against floating CS (the flying-lead risk of §2.1 WARN-5). It is **orthogonal to BF-1** and **does not replace** the 3-attempt gate or the per-attempt byte log — the two measures now cover two different risks |
+
 **Document rule respected:** this appendix is appended; no earlier section, decision row or `§…` numbering
 was edited, renumbered or deleted.
 
