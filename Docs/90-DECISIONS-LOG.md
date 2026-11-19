@@ -310,6 +310,46 @@ Nyquist, so a band limit expressed only on the host side cannot fix it. The fix 
 
 ---
 
+## Appendix H — M0 Toolchain & HAL Bring-up Findings (Rev 3.5)
+
+**Provenance.** Recorded during the M0 bootstrap (repo setup + 84 MHz clock bring-up,
+`platformio.ini` + `src/main.c`), on the actual build environment: **PlatformIO Core 6.2.0**,
+**`platform = ststm32@19.1.0`** (git tag `v19.1.0`, commit `eb98d12`, released 2025-03-26),
+**`framework-stm32cubef4 @ 1.28.3`** (the platform's own `platform.json` requires `~1.28.1`, so 1.28.3 is
+the resolved HAL — the version `.clinerules` claims and §2.3 assumes), **toolchain-gccarmnoneeabi
+@ 1.70201.0 (GCC 7.2.1)**, board `genericSTM32F405RG` (`build.mcu = stm32f405rgt6`), linker script
+`tool-ldscripts-ststm32/STM32F4/STM32F405RGTX_FLASH.ld`. Every claim below was **measured** (recorded
+compile flags in `.pio/build/<env>/idedata.json`, object sizes via `arm-none-eabi-size`, object sections
+via `objdump -h`) or read from the HAL headers actually used by the build (path + line number quoted).
+These are toolchain facts, not strategy changes: **container format v4 and every §… figure are untouched.**
+
+| ID | Finding | Evidence (measured) | Rule adopted |
+|----|---------|---------------------|--------------|
+| **TC-1** | **PlatformIO's default `-Os` silently overrides the env's `-O2`.** `DefaultEnvironment` appends its own optimisation level **after** the user's `build_flags`, and GCC honours the **last** `-O` on the command line. `env:release` therefore compiled at `-Os` while appearing to request `-O2` (P3 satisfied only on paper) | Before the fix, `idedata.json` `cc_flags` for `env:release` read `-O2 -mthumb -mcpu=cortex-m4 -Os -ffunction-sections -fdata-sections -Wall -nostdlib`, and `src/main.c` produced **byte-identical objects in both environments** (`.text.startup.main 0xe8` + `.text.unlikely.app_error_halt 0x14` = 252 B in each). Independent control compile of the same file: `-O2 → 252 B`, `-Og → 300 B` — the two 252 B objects proved `-Os` was in force | **`build_unflags = -Os` is mandatory** in `[common]` and is interpolated into every environment (`build_unflags = ${common.build_unflags}`). After the fix: release `cc_flags` contain `-O2` with **no `-Os`**, `main.o` = 252 B, and the HAL library follows the env level too (`stm32f4xx_hal_rcc.o` 1916 B at `-O2` vs 2146 B at `-Og`) |
+| **TC-2** | **`extends` does not reliably merge `build_flags`.** When a child environment declares its own `build_flags`, the parent section's flags were **silently dropped** — in practice `-DHSE_VALUE=8000000` disappeared and `HSE_VALUE` stayed at the HAL default `25000000U` (`stm32f4xx_hal_conf_template.h:94`, behind `#if !defined(HSE_VALUE)`). A build with no warning and no error | Caught only because `src/main.c` carries preprocessor guards on the §2.2 arithmetic: with a 25 MHz HSE the same PLL constants give REF = 3.125 MHz, **VCO = 1050 MHz** (outside the 100…432 MHz range) and **SYSCLK = 262.5 MHz** (vs 168 MHz absolute maximum, and beyond the Flash/regulator rating), plus PLL48CK = 150 MHz instead of 48 MHz. After the fix `idedata.json` `defines` contain `HSE_VALUE=8000000` | **Every environment must interpolate explicitly**: `build_flags = ${common.build_flags} …`. Never rely on implicit inheritance for a flag that changes a clock, an address or a size. The §2.2 arithmetic is additionally asserted **at compile time** in `src/main.c` (`#error` if `HSE_VALUE != 8000000`, if `HSE/M×N÷P != 84 000 000`, if `HSE/M×N÷Q != 48 000 000`) so a dropped flag cannot survive a build |
+| **TC-3** | **HAL F4 1.28.3 API specifics** — three CubeMX-era assumptions are false for this HAL | (a) `FLASH_LATENCY_2WS` **does not exist**; the name is `FLASH_LATENCY_2` = `FLASH_ACR_LATENCY_2WS` (`stm32f4xx_hal_flash_ex.h:276`). (b) `RCC_OscInitTypeDef` on F4 has **no `HSEPredivValue`** field (the struct is `OscillatorType, HSEState, LSEState, HSIState, HSICalibrationValue, LSIState, PLL` — `stm32f4xx_hal_rcc.h:49-70`); the HSE pre-divider is an F1/L1 concept. (c) **`HAL_PWREx_ConfigSupply()` is not present**, and neither is `PWR_FLAG_VOSRDY` (no match in `stm32f4xx_hal_pwr_ex.h`), even though `HAL_PWREx_ControlVoltageScaling()` is declared there (`:208`) | For regulator Scale 1 use the documented macro **`__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1)`** (`stm32f4xx_hal_pwr_ex.h:117` and `:135`; the constant at `:69`/`:72`), **after** `__HAL_RCC_PWR_CLK_ENABLE()`. Flash latency at 84 MHz is written `FLASH_LATENCY_2` (§2.2 "FLASH 2 WS"). Do not write CubeMX snippets from other families into this tree without checking the vendored header |
+
+### Consequences for the §10.2.1 preconditions
+
+- **P3 is now real, not nominal.** `pio run -e release` builds at `-O2` (verified by `cc_flags` and by the
+  `-O2`/`-Og` object-size signature), so the §9 CPU figures and the K8 4–8 % acceptance band now describe a
+  build that exists. **Still open:** the acceptance artefact "`map` file exists" is not met — no
+  `-Wl,-Map=…` (and no `-fstack-usage`) is in the build yet; that pairs with **P4** (`.d1ram` + `ASSERT`).
+- **P2 is half closed.** The platform and, through it, the HAL are pinned (19.1.0 → cubef4 1.28.3), but the
+  HAL is **not vendored into the repo**: the builder copies
+  `stm32f4xx_hal_conf_template.h` → `stm32f4xx_hal_conf.h` **inside the global package directory**
+  (`framework-stm32cubef4/Drivers/STM32F4xx_HAL_Driver/Inc/`), so today the HAL configuration — and with it
+  every `SDMMC_*TIMEOUT`, `TICK_INT_PRIORITY` and module-enable switch that §2.3 rule 1 and §5.2 demand an
+  audit of — lives outside version control. Vendoring HAL (and `ff.c`, P1) into `lib/` is what makes those
+  audit instructions actionable.
+- **HAL `HAL_GetVersion()` printing at BOOT** (P2 acceptance) is still pending: it needs the debug UART
+  (§2.1, PA9/PA10, 115200), which the bootstrap deliberately does not implement.
+
+**Document rule respected:** this appendix is appended; no earlier section, decision row or `§…` numbering
+was edited, renumbered or deleted.
+
+---
+
 *End of SD_LOGGER_STRATEGY.md Rev 3.5 — container format version 4, unchanged (no field moves; five new
 fields carved from existing reserved runs: HEADER `0x0CA…0x0CF`, MAN `0x1C0…0x1C5`, TRAILER `0x06D…0x070`).*
 **Sections retained: all of V3.3 and all of V3.4, corrected in place — nothing was deleted, no `§N.M` was
