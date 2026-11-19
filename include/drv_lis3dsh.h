@@ -67,6 +67,37 @@ drv_lis3dsh_status_t drv_lis3dsh_spi_init(void);
 drv_lis3dsh_status_t drv_lis3dsh_read_reg(uint8_t addr, uint8_t *value);
 
 /**
+ * @brief  Write one register, then READ IT BACK and compare (audit WARN-6).
+ * @param  addr  Register address, 0x00..0x7F (bits above the mask are ignored).
+ * @param  data  The byte to store.
+ * @return DRV_LIS3DSH_OK only when the write frame completed AND a following read of
+ *         the same address returned exactly `data`. DRV_LIS3DSH_ERR_SPI on a failed
+ *         transfer, on a failed read-back frame, or on a mismatch.
+ * @note   WHY THE READ-BACK IS NOT OPTIONAL. The command byte is RW(bit7) + AD6..AD0
+ *         and has no room for anything else ([DS §5.2:296-313]). If a bit of that
+ *         byte is ever shifted — the BUG-1 mechanism, or a corrupted frame inside
+ *         RECORDING — the part decodes the frame as a READ: the value is discarded,
+ *         the part drives SDO instead of latching, HAL returns HAL_OK because the
+ *         master completed its 16 clocks, and no error flag is set. A mis-decoded
+ *         write is invisible from the bus, so verification is the only probe. In
+ *         §3.1 steps 1/3..7 an unverified write means a campaign logged plausible
+ *         zeros, which is exactly what §3.1 rule 5 refuses.
+ * @note   Equality is meaningful for plain R/W registers only. CTRL_REG3 = 0x01 is
+ *         expected to SELF-CLEAR STRT (§3.1 step 1, Docs/02-FIRMWARE-DESIGN.md:143)
+ *         and CTRL_REG6.BOOT clears ADD_INC / FIFO_EN ([DS F3],
+ *         Docs/02-FIRMWARE-DESIGN.md:215-217): those writes need a masked comparison,
+ *         decided with the step that performs them. TODO: verify against bench.
+ * @note   Driver prohibitions still apply to the CALLER: never write an address absent
+ *         from the register map, never touch factory-calibration registers
+ *         ([DS §6/§11], Docs/02-FIRMWARE-DESIGN.md:225-232). This function polices the
+ *         frame, not the address map.
+ * @note   Single-threaded BOOT / super-loop use only: it shares the static frame
+ *         buffers with drv_lis3dsh_read_reg() and no DMA stream is armed — see the
+ *         §3.2.6 note inside drv_lis3dsh_read_reg().
+ */
+drv_lis3dsh_status_t drv_lis3dsh_write_reg(uint8_t addr, uint8_t data);
+
+/**
  * @brief  The M0 presence gate: read WHO_AM_I (0x0F), expect 0x3F.
  * @param  value  Receives the device ID byte.
  * @return DRV_LIS3DSH_OK / DRV_LIS3DSH_ERR_SPI (caller compares against

@@ -16,6 +16,43 @@
  *   container HEADER at 0x04D (Docs/01-CONTAINER-FORMAT.md:178) — a forensic
  *   record, not merely a boot check.
  *
+ * AUDIT BUG-1 — CLOSED IN THIS FILE (M0 bench finding BF-1 explained, not re-described).
+ *   The BF-1 signature (attempt 1 = 0xFF, attempt 2 = 0x3F, s_spi_err_cnt = 0, all
+ *   four signals clean on the scope) is produced on the MCU side, not by the part:
+ *   SCK carried an internal pull-DOWN, so it sat LOW for as long as SPI1_CR1.SPE = 0.
+ *   HAL sets SPE only inside a transfer (stm32f4xx_hal_spi.c:1207-1212) and never
+ *   clears it on the PIO path (:1269-1381, SPI_EndRxTxTransaction :3617-3658), and
+ *   this driver asserts CS before calling it. So the 0 -> 1 SPE write drove SCK to
+ *   its CPOL = 1 idle level *under a low CS*: a rising edge, and [DS §5.2:290]
+ *   defines the rising edge as the CAPTURE edge. The part shifts its command byte by
+ *   one bit, never decodes 0x8F, never drives SDO in the data phase, and the pull-up
+ *   on PA6 reads 0xFF — while the master still runs its 16 clocks, so no OVR, no
+ *   MODF, no timeout is even possible. Attempt 2 answered because SPE was already 1
+ *   and no such transition existed any more. Two rules now hold the bus:
+ *     1. PA5 carries an internal PULL-UP: SCK sits at the CPOL = 1 idle level even
+ *        with SPE = 0, as [DS §5.2:289] requires ("SPC is held high while CS is
+ *        high"). PA7 keeps its pull-down — SDI is data, not a clock.
+ *     2. CR1.SPE is armed once in drv_lis3dsh_spi_init(), before any CS edge, so the
+ *        only idle-level transition happens while CS is HIGH and the part is
+ *        deselected. The pull-up removes the low state; the pre-arm removes the
+ *        transition. Both are needed: neither one alone closes BF-1.
+ *   The 3-attempt gate of §3.1 stays untouched: it is the measurement instrument for
+ *   this fix, not part of it. Expected new bench result after the fix is 0x3F on
+ *   attempt 1; 0xFF on attempt 1 again would REFUTE the mechanism and leave the
+ *   interface-mode-switch explanation of §3.1:165-167 standing.
+ *
+ * AUDIT WARN-5 — CLOSED IN THIS FILE. lis3dsh_flush_peripheral() clears and re-sets
+ *   SPE (__HAL_SPI_CLEAR_MODFFLAG ends by writing CR1.SPE = 0, stm32f4xx_hal_spi.h:
+ *   417-428), i.e. it can re-create the BUG-1 edge from the error path. It now
+ *   releases CS as its first action, so the ordering rule "re-arm SPE only with CS
+ *   released" is enforced by the code instead of inherited from the call site.
+ *
+ * AUDIT WARN-6 — CLOSED IN THIS FILE. drv_lis3dsh_write_reg() reads the byte back and
+ *   compares. A command byte has no room for a check field ([DS §5.2:296-313]), so a
+ *   lost or shifted RW bit turns a write into a read that the part answers happily
+ *   and the master can never distinguish from success. Read-back is the only probe.
+ *   Still not called in this build — no register is configured yet.
+ *
  * WHAT IT DELIBERATELY DOES NOT DO (scope discipline).
  *   No STRT reset, no CTRL_REG5 / FIFO_CTRL / CTRL_REG6 / CTRL_REG3 / CTRL_REG4
  *   (§3.1 steps 1, 3..7), no self-test (§3.3), no FIFO drain / mode B (§3.2), no
@@ -71,6 +108,7 @@
  * -------------------------------------------------------------------------- */
 #define LIS3DSH_CMD_READ       0x80U  /* [DS §5.2] bit7 RW = 1 -> read                            */
 #define LIS3DSH_ADDR_MASK      0x7FU  /* [DS §5.2] AD6..AD0; the byte has no room for an MS bit    */
+#define LIS3DSH_CMD_WRITE      0x00U  /* [DS §5.2:303] bit7 RW = 0 -> write; the 7 address bits pass through unchanged */
 #define LIS3DSH_REG_WHO_AM_I   0x0FU  /* [DS §6 register map / §7.4] device ID, fixed 0x3F         */
 #define LIS3DSH_SPI_FRAME_LEN  2U     /* [DS §5.2] command byte + one data byte = 16 clocks        */
 
@@ -97,6 +135,7 @@
 static SPI_HandleTypeDef s_hspi1;      /* SPI1 handle; zero-initialised, HAL fills State/Lock */
 static uint8_t           s_tx[LIS3DSH_SPI_FRAME_LEN];
 static uint8_t           s_rx[LIS3DSH_SPI_FRAME_LEN];
+static volatile uint32_t s_write_mismatch_cnt; /* WARN-6: writes that completed but whose read-back differed. volatile so -O2 keeps every store; read it over SWD, same role as s_lis3dsh_log[] in main.c */
 static uint32_t          s_spi_err_cnt;  /* failed transactions since reset (bench-visible) */
 
 static void lis3dsh_cs_select(void);
@@ -145,9 +184,24 @@ static void lis3dsh_cs_release(void)
  *         back as the answer of the NEXT attempt — which is exactly the failure
  *         mode §3.2.6 exists to prevent. Without this flush, "the second read
  *         worked" and "the first read poisoned the second" are indistinguishable.
+ * @note   WARN-5 — CS MUST BE HIGH WHILE THIS RUNS, and the first line of this
+ *         function makes that true instead of leaving it to the call site.
+ *         __HAL_SPI_CLEAR_MODFFLAG ends by writing CR1.SPE = 0
+ *         (stm32f4xx_hal_spi.h:417-428) and the SET_BIT at the end of this function
+ *         writes it back to 1. Re-arming SPE is exactly the action that moves SCK to
+ *         the CPOL = 1 idle level, and per [DS §5.2:290] the rising edge into that
+ *         level is the CAPTURE edge: done under a low CS it eats one bit of the next
+ *         command byte — the BUG-1 failure, re-created from the error path. With the
+ *         PA5 pull-up in place the level no longer actually moves, so this guard is
+ *         deliberately redundant today; it exists so the ordering rule survives any
+ *         change in the pull configuration (an external pull, NOPULL, or an SPI1
+ *         power-down in IDLE per §2.1:1054) and so a future §3.2.6 caller cannot get
+ *         the order wrong. The same rule still has to be written into §3.2.6 itself
+ *         (audit BUG-2) — Docs/ is not touched by this step.
  */
 static void lis3dsh_flush_peripheral(void)
 {
+    lis3dsh_cs_release();   /* WARN-5 precondition, enforced by doing it: PA4 high, idempotent when already high */
     __HAL_SPI_CLEAR_OVRFLAG(&s_hspi1);     /* SPI1_DR read, then SPI1_SR read: drains the receive register and clears SPI_SR.OVR (RM0090 clear sequence) */
     __HAL_SPI_CLEAR_CRCERRFLAG(&s_hspi1);  /* SPI1_SR := ~SPI_SR_CRCERR; CRC is disabled, so this only guarantees no stale bit */
     __HAL_SPI_CLEAR_MODFFLAG(&s_hspi1);    /* SPI1_SR read, then SPI_CR1.SPE = 0 (MODF cannot set with CR1.SSI = 1, cleared anyway) */
@@ -185,10 +239,41 @@ drv_lis3dsh_status_t drv_lis3dsh_spi_init(void)
     HAL_GPIO_Init(LIS3DSH_CS_PORT, &io);
     HAL_GPIO_WritePin(LIS3DSH_CS_PORT, LIS3DSH_CS_PIN, GPIO_PIN_SET);  /* §2.1: initial state = deselected */
 
-    /* --- SCK + MOSI as AF5, held low while SPI1 is still disabled -------------- */
-    io.Pin       = SPI1_SCK_PIN | SPI1_MOSI_PIN;  /* PA5 + PA7 (§2.1) */
+    /* --- SCK (PA5) as AF5, with an internal PULL-UP ----------------------------
+       BUG-1 fix. [DS §5.2:289]: "SPC is held high while CS is high" — at CPOL = 1
+       the idle clock level IS the high level, so a pull-DOWN here held SCK LOW for
+       as long as SPI1_CR1.SPE = 0. HAL only raises SPE inside a transfer
+       (stm32f4xx_hal_spi.c:1207-1212) and never clears it on the PIO path
+       (:1269-1381, SPI_EndRxTxTransaction :3617-3658), and this driver asserts CS
+       before calling it: the 0 -> 1 SPE write therefore drove SCK high *under a low
+       CS*, which [DS §5.2:290] defines as the CAPTURE edge. The part shifts its
+       command byte by one bit, never decodes 0x8F, never drives SDO in the data
+       phase, and the PA6 pull-up reads 0xFF — with the master finishing its 16
+       clocks, so OVR / MODF / timeout cannot even be reported. That is the BF-1
+       signature in full, including "attempt 2 answered".
+       A pull-up makes the required idle level hold before the peripheral drives the
+       pin. GPIO_PUPDR is written by HAL_GPIO_Init in AF mode too, so the pull is
+       live while SPE = 0. The pull-up removes the low state; the SPE pre-arm below
+       removes the transition — both are needed.
+       TODO: verify against bench — "PUPDR stays active in AF mode" and "SPE = 1
+       drives SCK to the CPOL level" are RM0090 statements (precondition P5,
+       Docs/03-TEST-PLAN.md:80) argued here from observed behaviour, not from the PDF. */
+    io.Pin       = SPI1_SCK_PIN;                  /* PA5 alone (§2.1) — never in the same call as PA7 */
     io.Mode      = GPIO_MODE_AF_PP;               /* alternate-function push-pull */
-    io.Pull      = GPIO_PULLDOWN;                 /* pulls stay active in AF mode: SCK/SDI quiet before SPE = 1 */
+    io.Pull      = GPIO_PULLUP;                   /* SCK held at the CPOL = 1 idle level even with SPE = 0 ([DS §5.2:289]) */
+    io.Speed     = SPI1_AF_SPEED;                 /* 5.25 MHz needs more than LOW's 5.5 MHz ceiling */
+    io.Alternate = SPI1_AF;                       /* AF5 = SPI1/I2S1 (RM0090 Table 9) */
+    HAL_GPIO_Init(SPI1_PIN_PORT, &io);
+
+    /* --- MOSI / SDI (PA7) as AF5, with a pull-DOWN -----------------------------
+       A separate HAL_GPIO_Init call on purpose: SCK and MOSI need OPPOSITE pulls,
+       and one call applies one io.Pull to every bit of io.Pin — driving both pins
+       from a single call is precisely what made the wrong pull possible. SDI is
+       data, not a clock: holding it low while SPE = 0 keeps the sensor's input quiet
+       and cannot be mistaken for a clock edge by a part that is not being clocked. */
+    io.Pin       = SPI1_MOSI_PIN;                 /* PA7 (§2.1) */
+    io.Mode      = GPIO_MODE_AF_PP;               /* alternate-function push-pull */
+    io.Pull      = GPIO_PULLDOWN;                 /* SDI quiet before SPE = 1 (intent unchanged) */
     io.Speed     = SPI1_AF_SPEED;                 /* 5.25 MHz needs more than LOW's 5.5 MHz ceiling */
     io.Alternate = SPI1_AF;                       /* AF5 = SPI1/I2S1 (RM0090 Table 9) */
     HAL_GPIO_Init(SPI1_PIN_PORT, &io);
@@ -241,6 +326,23 @@ drv_lis3dsh_status_t drv_lis3dsh_spi_init(void)
         s_spi_err_cnt++;
         return DRV_LIS3DSH_ERR_SPI;
     }
+
+    /* --- Arm SPE before the first CS edge (BUG-1, second half of the fix) ------
+       With CR1.SPE = 1 and no transfer in progress the peripheral drives SCK to its
+       CPOL = 1 idle level, and CR1.SSI = 1 (SPI_MODE_MASTER,
+       stm32f4xx_hal_spi.h:207) keeps the internal NSS asserted, so an idle enabled
+       master cannot raise MODF. The idle-level transition therefore happens HERE,
+       while PA4 is HIGH and the part is deselected ([DS §5.2:289]) — and never while
+       CS is low, where [DS §5.2:290] would make it a capture edge and cost the next
+       command byte one bit.
+       HAL_SPI_TransmitReceive() then takes its "already enabled" branch
+       (stm32f4xx_hal_spi.c:1207-1212) and writes no SPE transition of its own; its
+       PIO 8-bit path never disables SPE (:1269-1381 and SPI_EndRxTxTransaction
+       :3617-3658), so this single arm holds for every later BOOT frame. Anything
+       that does clear SPE — the flush above, HAL's DMA-abort paths (:3084), a future
+       IDLE power-down of SPI1 (§2.1:1054) — must re-arm under the same rule: CS
+       high. Register: SPI1_CR1.SPE = 1. */
+    SET_BIT(SPI1->CR1, SPI_CR1_SPE);   /* SPI_CR1.SPE = 1 -> SCK at the CPOL idle level before any CS edge */
 
     return DRV_LIS3DSH_OK;
 }
@@ -295,6 +397,95 @@ drv_lis3dsh_status_t drv_lis3dsh_read_reg(uint8_t addr, uint8_t *value)
        arrives during the dummy clock, i.e. in s_rx[1] ([DS §5.2]: second byte is
        DO7..DO0). */
     *value = s_rx[1];
+    return DRV_LIS3DSH_OK;
+}
+
+/**
+ * @brief  Write one register and VERIFY it by reading it back — §3.1 transport for
+ *         steps 1 and 3..7, closing audit WARN-6.
+ * @param  addr  Register address, 0x00..0x7F (bits above the mask are ignored).
+ * @param  data  The byte to store.
+ * @return DRV_LIS3DSH_OK only if the write frame completed AND a read of the same
+ *         address afterwards returned exactly `data`. DRV_LIS3DSH_ERR_SPI on a failed
+ *         transfer, on a failed read-back frame, or on a read-back mismatch.
+ * @note   Side effects: 2 x (CS low, 16 clocks, CS high) — one write frame and one
+ *         read frame; SPI1_DR/SR traffic, s_tx/s_rx, s_spi_err_cnt and, on a
+ *         mismatch, s_write_mismatch_cnt. Nothing else.
+ * @note   WHY THE READ-BACK IS NOT OPTIONAL. A command byte is RW(bit7) + AD6..AD0
+ *         with no room for anything else ([DS §5.2:296-313]), so there is no
+ *         checksum, no complement, no second byte to compare against on the wire. If
+ *         a bit of that byte is shifted — the BUG-1 mechanism, or a corrupted frame
+ *         later inside RECORDING — a write can be decoded as a READ: the part
+ *         discards the value, drives SDO instead of latching it, and the master still
+ *         completes its 16 clocks and gets HAL_OK with no OVR/MODF/timeout. A
+ *         mis-decoded write is therefore INVISIBLE from the bus, and the only probe
+ *         is to read the register back. §3.1 rule 5 (Docs/02-FIRMWARE-DESIGN.md:173)
+ *         refuses a file of plausible zeros; an unverified CTRL_REG5 / FIFO_CTRL /
+ *         CTRL_REG4 write is exactly how such a file is produced.
+ * @note   NOT CALLED IN THIS BUILD. §3.1 steps 1 and 3..7 are the next sensor step;
+ *         the function exists now so that step inherits the verification instead of
+ *         rediscovering the need for it, and so the presence gate below keeps its
+ *         read-only character.
+ * @note   TODO: verify against bench — the equality test is valid for plain R/W
+ *         registers only. Two §3.1 writes cannot be judged by `readback == data`:
+ *         CTRL_REG3 = 0x01 is expected to SELF-CLEAR STRT (§3.1 step 1,
+ *         Docs/02-FIRMWARE-DESIGN.md:143) and CTRL_REG6 BOOT clears ADD_INC / FIFO_EN
+ *         ([DS F3], Docs/02-FIRMWARE-DESIGN.md:215-217). A masked comparison for those
+ *         is a decision for the step that performs them, not a guess here.
+ */
+drv_lis3dsh_status_t drv_lis3dsh_write_reg(uint8_t addr, uint8_t data)
+{
+    HAL_StatusTypeDef hal_status;
+    uint8_t           readback = 0U;
+
+    /* Command byte: RW = 0, then the 7-bit address ([DS §5.2:303]). s_tx[1] is
+       DI7..DI0 = the value being written. s_rx[] receives two don't-care bytes, and
+       HAL requires a non-NULL receive buffer in full-duplex. */
+    s_tx[0] = (uint8_t)(LIS3DSH_CMD_WRITE | (addr & LIS3DSH_ADDR_MASK));
+    s_tx[1] = data;
+
+    lis3dsh_cs_select();
+
+    /* One call = 16 clock pulses with CS held low throughout, which is the "single
+       transfer = 16 clock pulses" of [DS §5.2:292]. */
+    hal_status = HAL_SPI_TransmitReceive(&s_hspi1, s_tx, s_rx,
+                                        (uint16_t)sizeof(s_tx),
+                                        LIS3DSH_SPI_TIMEOUT_MS);
+
+    lis3dsh_cs_release();   /* every path, including timeout (see that function's note) */
+
+    if (hal_status != HAL_OK)
+    {
+        s_spi_err_cnt++;
+        lis3dsh_flush_peripheral();   /* CS is already high here; flush re-arms it as its first action anyway (WARN-5) */
+        return DRV_LIS3DSH_ERR_SPI;
+    }
+
+    /* Second, separate frame: 0x80|addr then one clocked-out byte — the same framing
+       as any read, so it inherits the §3.2.6 note written in drv_lis3dsh_read_reg():
+       the day DMA2 S0/S3 are armed, that function is the one that has to quiesce. */
+    if (drv_lis3dsh_read_reg(addr, &readback) != DRV_LIS3DSH_OK)
+    {
+        /* drv_lis3dsh_read_reg() has already counted its own failure. Counting the
+           same bad frame twice would make s_spi_err_cnt describe a fiction instead of
+           a number of frames. The write is unverified, and unverified is reported as
+           a failure, never as a success. */
+        return DRV_LIS3DSH_ERR_SPI;
+    }
+
+    if (readback != data)
+    {
+        /* The silent-write signature WARN-6 describes: electrically clean frames,
+           HAL_OK, wrong register content. Counted in two places on purpose —
+           s_spi_err_cnt keeps the transaction total honest, s_write_mismatch_cnt
+           separates "a frame failed" from "the frame completed and the part stored
+           something else", which is the distinction that points at the command byte
+           rather than at the wiring. Read both over SWD. */
+        s_spi_err_cnt++;
+        s_write_mismatch_cnt++;
+        return DRV_LIS3DSH_ERR_SPI;
+    }
+
     return DRV_LIS3DSH_OK;
 }
 
