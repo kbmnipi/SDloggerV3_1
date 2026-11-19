@@ -201,6 +201,31 @@ static void app_error_halt(void)
 }
 
 /**
+ * @brief  SysTick exception handler — the HAL time base.
+ * @param  none
+ * @return none. Executes in Handler mode once per millisecond (1 kHz, §2.2 SysTick).
+ * @note   WHY THIS EXISTS: Cube HAL F4 does not ship a SysTick_Handler. HAL_Init()
+ *         -> HAL_InitTick() arms SysTick with TICKINT, and without this strong
+ *         definition the SysTick vector resolves to the startup file's weak
+ *         Default_Handler (an infinite `B .`), so uwTick never advances and
+ *         HAL_Delay() hangs on its first call. Measured on the bench before this
+ *         fix: ICSR.VECTACTIVE=15 (SysTick), xPSR=0x6100000F, pc=0x08001030,
+ *         uwTick 0 -> 0 across a 1 s run window while SysTick VAL kept counting.
+ * @note   Global symbol ON PURPOSE — not static, and no prototype/extern added
+ *         here: a strong definition in this translation unit is what overrides the
+ *         weak startup_stm32f405xx entry, which is what makes the .isr_vector
+ *         SysTick slot point at real code instead of Default_Handler.
+ * @note   §2.3: SysTick is the lowest-priority exception, so this body is safe
+ *         under every producer the project will add later (TIM2 / SPI1 / SDIO /
+ *         DMA2 all sit above it). It does nothing but advance the time base —
+ *         no logging, no SDIO/FatFs, no SPI1/FIFO work (§2.3 hot-path rules).
+ */
+void SysTick_Handler(void)
+{
+    HAL_IncTick();   /* uwTick++ — the only timing source HAL_Delay relies on */
+}
+
+/**
  * @brief  Entry point: HAL init -> LED init -> 84 MHz clock -> 1 Hz heartbeat.
  * @return never returns.
  * @note   The super-loop is the single consumer context of the whole firmware
