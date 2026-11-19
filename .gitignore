@@ -14,7 +14,10 @@ cmake-build-*/
 !.vscode/settings.json
 !.vscode/extensions.json
 !.vscode/tasks.json
-!.vscode/launch.json
+# launch.json НЕ отслеживается: PlatformIO-расширение перезаписывает его при каждом
+# открытии debug-сессии (абсолютные пути к .pio/build/<env>, имя env, путь к SVD
+# запиненной платформы ststm32@…) — это машинно-генерируемый локальный файл,
+# а не часть архитектуры проекта. Отлаживаемый артефакт задаётся в platformio.ini (P2/P3).
 
 # =====================
 # Компиляция / прошивка
