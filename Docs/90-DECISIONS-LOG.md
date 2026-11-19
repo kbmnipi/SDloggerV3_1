@@ -345,6 +345,48 @@ These are toolchain facts, not strategy changes: **container format v4 and every
 - **HAL `HAL_GetVersion()` printing at BOOT** (P2 acceptance) is still pending: it needs the debug UART
   (§2.1, PA9/PA10, 115200), which the bootstrap deliberately does not implement.
 
+### Bench findings (M0, sensor bus) — appended 2026-11-19 (UTC)
+
+Same evidence bar as the TC rows above: every claim below was **measured on the flashed
+`env:release` build** (attempt log and counters read back over SWD), not inferred from the
+datasheet. These are bench facts, not strategy changes — **container format v4 and every §… figure
+are untouched**.
+
+| ID | Finding | Evidence (measured) | Rule adopted |
+|----|---------|---------------------|--------------|
+| **BF-1** | **LIS3DSH presence gate: the first SPI frame after power-up is a throwaway.** One `WHO_AM_I` read immediately after power-up carries no information about the health of the part, so the §3.1 step 2 gate must be a retry loop | `WHO_AM_I (0x0F)` attempt log after the release build was flashed: **attempt 1 → `0xFF`** (sensor silent), **attempt 2 → `0x3F`** (sensor present), **attempt 3 → not executed** (the gate exits early on the first match). **`s_spi_err_cnt = 0` for BOTH frames** — no transfer timeout, no `SPI_SR.OVR`, no `SPI_SR.MODF`, and all four signals measured present (CS asserted, 16 clocks on SCK, MOSI, MISO). After the pass the firmware sits in the 1 Hz heartbeat loop on PB2. SWD-visible evidence: `s_lis3dsh_log[]` (per-attempt byte, `0xEE` sentinel = "no byte at all"), `s_lis3dsh_id`, `s_spi_err_cnt` | Presence gate = **read `WHO_AM_I` until it returns `0x3F`, up to 3 attempts**, pass on any match; **the first frame after power-up is treated as a throwaway**; **per-attempt byte log kept**. No `0x3F` within 3 attempts → **initialization error, do not proceed** to §3.1 steps 3–7. Normative wording lives in §3.1 (note after the initialization table) |
+
+**Interpretation.** The sensor is **silent on frame 1 and answers from frame 2**. This is **not** a
+bus error: the transfer itself was clean on both attempts (`s_spi_err_cnt = 0`, no timeout, no
+`OVR`/`MODF`), so the difference between the frames is *whether the part answered*, not *whether
+the bus worked*. Reading `0xFF` is what an idle SDO on a pulled-up MISO looks like when the slave
+never drove the line.
+
+**Most likely mechanism.** [DS §5, `Docs/DS_lis3dsh.md:249`]: **`CS` high = I²C enabled / SPI idle;
+`CS` low = SPI active** (same statement in the pin table, `:117`). With `CS` high the part is in
+I²C mode; the **first falling CS edge after power-up is the moment the part first registers SPI
+mode**, and that frame can be lost. After it, the part answers normally. Stated as the leading
+explanation, not as a proven one — the observable rule (retry, log, fail loudly after 3) does not
+depend on which mechanism it is.
+
+**Reproducibility.** Confirmed **twice, independently**: on this bench, and on a **previous project
+that used the same sensor**, where `WHO_AM_I` likewise answered only from the second read. The
+first-frame loss is therefore treated as a **property of the part/interface at power-up**, not as a
+defect of this board.
+
+**Hardware note.** A **47 kΩ pull-up on CS (PA4)** has now been soldered, which **closes the
+"CS external pull-up" item of the §2.1 M0 mandatory bring-up checks** for the sensor bus. It
+mitigates a **different** risk — a floating CS at power-up, i.e. an undefined interface state, which
+matters on the flying leads of §2.1 WARN-5 — and it is **independent of the first-frame effect**: it
+does not by itself make attempt 1 answer, so the 3-attempt budget and the per-attempt log stay.
+
+**Consequences.** (a) The gate's pass/fail semantics are unchanged in kind — a presence gate still
+requires a positive `0x3F` — only its **attempt count** and its **diagnostic log** are now specified.
+(b) The §3.2.6 M0 assertion (post-init polled `WHO_AM_I` returns exactly `0x3F` with the DMA streams
+armed) and the §3.2.7 liveness poll are **not** relaxed: they run against an initialized, answering
+part. (c) **Open follow-up (bench, next M0 pass):** re-run the gate with the CS pull-up fitted to
+record whether attempt 1 now answers — this changes the observed attempt number, not the rule.
+
 **Document rule respected:** this appendix is appended; no earlier section, decision row or `§…` numbering
 was edited, renumbered or deleted.
 

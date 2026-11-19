@@ -1,12 +1,13 @@
 /**
  ******************************************************************************
  * @file    main.c
- * @brief   M0 bring-up, step 2: 84 MHz clock tree + 1 Hz heartbeat on PB2.
+ * @brief   M0 bring-up: 84 MHz clock tree + 1 Hz heartbeat on PB2 + the LIS3DSH
+ *          WHO_AM_I presence gate over SPI1 (§3.1 step 2).
  *
  * WHAT THIS FILE IS.
  *   The first executable artefact of the SD Logger V3 firmware. Its only job
  *   is to prove, on the bench, the clock gate of Docs/02-FIRMWARE-DESIGN.md
- *   §2.2 before any sensor or card code exists:
+ *   §2.2 before any card, ring or filesystem code exists:
  *     HSE 8 MHz -> PLL(M=8, N=336, P=4) -> SYSCLK 84 MHz, Q=7 -> PLL48CK 48 MHz
  *     AHB 84 · APB1 42 · APB2 84 · Flash 2 WS · regulator Scale 1
  *   The 1 Hz blink is the measurable side-effect: HAL_Delay() is derived from
@@ -14,19 +15,28 @@
  *   HAL_RCC_ClockConfig(), so a wrong clock changes the blink rate.
  *
  * WHAT IT DELIBERATELY DOES NOT DO.
- *   No SDIO, no SPI1, no FatFs, no ring buffer, no sensor (§10.2 order).
- *   No TIM2, no IWDG, no RTC, no ADC1. No RTOS, no malloc/new, no dynamic
- *   allocation (§2.3 rule 4). Nothing here touches the ISR hot path.
+ *   No SDIO, no FatFs, no ring buffer, no TIM2, no IWDG, no RTC, no ADC1
+ *   (§10.2 order). No RTOS, no malloc/new, no dynamic allocation (§2.3 rule 4).
+ *   SPI1 exists, but only as the §3.1 step 2 presence gate in drv_lis3dsh.c:
+ *   polled PIO, no DMA armed, and ODR never started, so the sensor stays in
+ *   power-down and cannot emit samples or INT1 edges. Nothing here touches the
+ *   ISR hot path.
  *
  * EXPECTED OBSERVATION ON THE BENCH.
  *   PB2 (status LED, active-HIGH, §2.1) toggles every 500 ms -> 1 Hz blink.
- *   LED permanently ON = clock bring-up failed (see app_error_halt).
+ *   LED permanently ON = a bring-up gate failed: clock tree, SPI1 init, the SPI
+ *   transaction itself, or no 0x3F in three WHO_AM_I attempts (app_error_halt).
+ *   N fast blinks right after reset, then a steady 1 Hz heartbeat = the gate
+ *   passed, and N (1..3) is the attempt on which WHO_AM_I first read 0x3F: the
+ *   gate is a 3-attempt OR (see the block in main and LIS3DSH_GATE_ATTEMPTS).
+ *   Two blinks therefore mean "the part only answers from the second frame".
  *   The §2.1/§2.2 verification gate itself is closed with a scope on the bus
  *   pins (or MCO), not by eyeballing the LED.
  ******************************************************************************
  */
 
 #include "stm32f4xx_hal.h" /* framework = stm32cube; the builder defines USE_HAL_DRIVER */
+#include "drv_lis3dsh.h"   /* §3.1 step 2 presence gate: SPI1 + WHO_AM_I (src/drv_lis3dsh.c) */
 
 /* ========================================================================== */
 /* §2.2 PLL constants — transcribed from the frozen clock tree, not chosen.   */
@@ -75,8 +85,46 @@
  * priority exception and there is no ISR here yet (§2.3 rule 3). */
 #define HEARTBEAT_HALF_PERIOD_MS  500U
 
+/* --------------------------------------------------------------------------
+ * §3.1 step 2 presence gate: attempt budget and bench encoding.
+ *
+ * LIS3DSH_GATE_ATTEMPTS — WHO_AM_I is read up to this many times and the gate
+ * PASSES IF ANY ATTEMPT READS 0x3F (logical OR, not AND). Why that is a
+ * legitimate gate and not a weakened one is argued where it is used, in main().
+ * LIS3DSH_GATE_GAP_MS — separation between attempts. 10 ms is the datasheet's
+ * conservative floor for the "any event" waits ([DS §9/§11: after STRT/BOOT
+ * >= 10 ms]) and is free in BOOT, so the gap is never the variable under test;
+ * at 5.25 MHz one frame is 3.05 us, i.e. the gap is ~3000x the frame.
+ * GATE_XFER_FAIL_MARKER — what s_lis3dsh_log[] holds for an attempt where the
+ * transfer itself failed. Chosen as a value that is not an answer, so "no byte"
+ * can never be mistaken for "a byte that was not 0x3F" when the log is read.
+ * -------------------------------------------------------------------------- */
+#define LIS3DSH_GATE_ATTEMPTS     3U
+#define LIS3DSH_GATE_GAP_MS       10U
+#define GATE_XFER_FAIL_MARKER     0xEEU
+
+/* Bench encoding of a PASS: N fast blinks, where N = the number of the attempt
+ * on which 0x3F first appeared. 80 ms is ~6x shorter than the 500 ms heartbeat
+ * half-period, so the announce cannot be confused with the heartbeat that
+ * follows. A FAIL is LED solid ON via app_error_halt(): no blinks at all.
+ * Re-watch the announce by pressing RESET — it runs once per boot. */
+#define SENSOR_OK_BLINK_HALF_MS   80U
+#define SENSOR_OK_PAUSE_MS        1000U
+
+/* Per-attempt evidence, the actual payload of this experiment and the reason it
+   is worth more than a pass/fail LED: one byte per attempt, so a run that passes
+   on the second try is distinguishable from one that passes on the first.
+   Read over SWD; volatile so -O2 keeps every store. 0xEE = transfer failed. */
+static volatile uint8_t s_lis3dsh_log[LIS3DSH_GATE_ATTEMPTS];
+
+/* Last byte the bus produced, readable over SWD (there is no UART yet, so this
+   is the cheapest evidence available, and volatile is what stops -O2 from
+   removing it). 0x3F = present · 0xFF = nothing drove MISO · 0x00 = held low. */
+static volatile uint8_t s_lis3dsh_id;
+
 static void SystemClock_Config(void);
 static void bsp_status_led_init(void);
+static void app_blink_pass(uint32_t times);
 static void app_error_halt(void);
 
 /**
@@ -176,7 +224,37 @@ static void bsp_status_led_init(void)
 }
 
 /**
- * @brief  Defensive halt for a failed clock bring-up. No silent failures (§2.3).
+ * @brief  Announce "presence gate PASSED": N fast blinks, then a pause.
+ * @param  times  Blinks to emit = the number of the attempt on which WHO_AM_I
+ *                first read 0x3F (1..LIS3DSH_GATE_ATTEMPTS). Never 0: the
+ *                no-match path halts in app_error_halt() before this is reached.
+ * @return none. Side effects: drives PB2, consumes (times x 160 ms) + 1000 ms of
+ *         HAL_Delay time in thread context.
+ * @note   WHY A DISTINCT PATTERN: §10.2 makes M0's exit "LED codes readable". With
+ *         no UART yet, the blink is the only channel, so "sensor found" must not
+ *         look like the 1 Hz heartbeat. Explicit SET/RESET instead of TogglePin
+ *         keeps the pattern phase-deterministic whatever state the previous
+ *         function left the pin in.
+ * @note   HAL_Delay stays in thread context only (§2.3 rule 3): SysTick is the
+ *         lowest-priority exception and no producer exists yet.
+ */
+static void app_blink_pass(uint32_t times)
+{
+    for (uint32_t n = 0U; n < times; n++)
+    {
+        HAL_GPIO_WritePin(STATUS_LED_PORT, STATUS_LED_PIN, GPIO_PIN_SET);
+        HAL_Delay(SENSOR_OK_BLINK_HALF_MS);      /* 80 ms ON  */
+        HAL_GPIO_WritePin(STATUS_LED_PORT, STATUS_LED_PIN, GPIO_PIN_RESET);
+        HAL_Delay(SENSOR_OK_BLINK_HALF_MS);      /* 80 ms OFF */
+    }
+
+    /* Separator gap: guarantees the last fast blink cannot merge into the first
+       half-cycle of the heartbeat that follows. */
+    HAL_Delay(SENSOR_OK_PAUSE_MS);
+}
+
+/**
+ * @brief  Defensive halt for a failed bring-up gate. No silent failures (§2.3).
  * @param  none
  * @return none — never returns.
  * @note   WHY THIS EXISTS: if HSE never locks or the PLL never locks, every
@@ -191,7 +269,7 @@ static void bsp_status_led_init(void)
  */
 static void app_error_halt(void)
 {
-    HAL_GPIO_WritePin(STATUS_LED_PORT, STATUS_LED_PIN, GPIO_PIN_SET);  /* PB2 high = clock fault */
+    HAL_GPIO_WritePin(STATUS_LED_PORT, STATUS_LED_PIN, GPIO_PIN_SET);  /* PB2 solid ON = a bring-up gate failed (clock tree, SPI1 init/transfer, or WHO_AM_I) */
     __disable_irq();
     for (;;)
     {
@@ -243,6 +321,95 @@ int main(void)
 
     /* §2.2: SYSCLK 84 MHz, PLL48CK 48 MHz, AHB 84 / APB1 42 / APB2 84, 2 WS. */
     SystemClock_Config();
+
+    /* ======================================================================
+     * §3.1 step 2 — LIS3DSH presence gate over SPI1 (§2.1 wiring, [DS §5.2]
+     * framing, [DS §7.4] fixed ID), TOLERANT FORM: up to
+     * LIS3DSH_GATE_ATTEMPTS reads of WHO_AM_I, PASS IF ANY ONE of them reads
+     * 0x3F. It runs after the clock gate because SPI1's 5.25 MHz is APB2/16 and
+     * the HAL transfer timeout needs the live 1 ms SysTick tick, and after the
+     * LED exists because every failure below ends in app_error_halt().
+     *
+     * WHY OR-OF-3 IS STILL A GATE AND NOT A WEAKENING OF IT.
+     *   The bench now shows all four signals present (CS asserted, 16 clocks,
+     *   MOSI, MISO) and still no 0x3F on the first read, and the owner's note
+     *   from an earlier project is that the part answered WHO_AM_I only from the
+     *   second read. Two mechanisms produce exactly that signature, and neither
+     *   of them says anything about the health of the part:
+     *     1) F4 master-enable corner. HAL_SPI_TransmitReceive() sets
+     *        SPI1_CR1.SPE and writes SPI1_DR in the same call, so attempt 1 is
+     *        the first frame after the peripheral is armed, while attempt N>1
+     *        runs with SPE already set. [DS §5.2] defines the frame boundary by
+     *        the CS edges alone, so a mis-framed first byte is not a "corrupt
+     *        answer" — the sensor never recognises the command and stays
+     *        tri-stated, which reads as 0xFF on a pulled-up MISO.
+     *     2) The interface is selected by CS itself: [DS §5] — "CS high = I2C
+     *        enabled / SPI idle, CS low = SPI active" — and the CS pull-up that
+     *        §2.1 lists as a MANDATORY M0 item is not fitted on this bench, so
+     *        the first CS-low edge can be consumed by the mode switch itself.
+     *   One miss is therefore not evidence of an absent part. One 0x3F, however,
+     *   IS a positive identification: no amount of retrying can invent 0x3F on a
+     *   bus that is genuinely dead, because every attempt then reads the same
+     *   pulled-up 0xFF or the same 0x00. The cost is ~20 ms of BOOT; the gain is
+     *   separating "sensor missing" from "first frame eaten".
+     *
+     * WHAT MAKES THIS AN EXPERIMENT AND NOT A HOPE: s_lis3dsh_log[] keeps the
+     * byte of every attempt, so the run says WHICH attempt answered. Two fast
+     * blinks confirms the theory; one blink means the first read was fine after
+     * all and the real fault is elsewhere; solid ON after three attempts refutes
+     * it and points back at wiring, supply or mode. Trailing zero entries in the
+     * log were simply never attempted (the loop broke early).
+     *
+     * BENCH ENCODING (there is still no UART):
+     *   N fast blinks, N = 1..3 = PASS, and N is the attempt that first read
+     *                             0x3F — §10.2's M0 sensor wiring check
+     *   LED solid ON            = FAIL, 0x3F never appeared
+     *   SWD evidence: s_lis3dsh_log[] (per-attempt byte, 0xEE = the transfer
+     *   itself failed), s_lis3dsh_id (last byte seen), s_spi_err_cnt.
+     * ==================================================================== */
+    if (drv_lis3dsh_spi_init() != DRV_LIS3DSH_OK)
+    {
+        app_error_halt();   /* the peripheral itself refused: nothing else can proceed */
+    }
+
+    /* Declared here (C99): one owner, one lifetime for the readback. */
+    uint8_t sensor_id = 0U;
+    uint32_t attempt;
+    uint32_t pass_attempt = 0U;   /* 0 = no attempt has matched yet */
+
+    for (attempt = 1U; attempt <= LIS3DSH_GATE_ATTEMPTS; attempt++)
+    {
+        if (drv_lis3dsh_who_am_i(&sensor_id) == DRV_LIS3DSH_OK)
+        {
+            s_lis3dsh_log[attempt - 1U] = sensor_id;
+
+            if (sensor_id == LIS3DSH_ID_WHO_AM_I)
+            {
+                pass_attempt = attempt;
+                break;   /* one 0x3F is enough — this is deliberately an OR gate */
+            }
+        }
+        else
+        {
+            /* A sentinel instead of a bus value: "no byte at all" must never be
+               read back later as "a byte that happened to be wrong". */
+            s_lis3dsh_log[attempt - 1U] = GATE_XFER_FAIL_MARKER;
+        }
+
+        if (attempt < LIS3DSH_GATE_ATTEMPTS)
+        {
+            HAL_Delay(LIS3DSH_GATE_GAP_MS);   /* thread context only (§2.3 rule 3) */
+        }
+    }
+
+    s_lis3dsh_id = sensor_id;   /* last byte the bus produced (0 = never got one) */
+
+    if (pass_attempt == 0U)
+    {
+        app_error_halt();   /* 0x3F never appeared in LIS3DSH_GATE_ATTEMPTS attempts */
+    }
+
+    app_blink_pass(pass_attempt);   /* N blinks = the N-th attempt answered */
 
     for (;;)
     {

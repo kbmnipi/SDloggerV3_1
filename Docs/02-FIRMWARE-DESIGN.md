@@ -107,6 +107,45 @@ Initialization order is mandatory: **reset → wait → configure → start ODR 
 | 6 | `CTRL_REG3 0x23` | `0x68` | IEA=1, IEL=1 **pulsed**, INT1_EN=1, STRT=0. **Polarity is a scope gate** ([DS E8]) |
 | 7 | `CTRL_REG4 0x20` | `0x9F` | **written last**: ODR=1001 → 1600 Hz, **BDU=1** (0x08), Zen/Yen/Xen=0x07. **BDU protects the output registers only, not the FIFO pop path** ([DS F10]) — kept because it is free, not because it covers the drain |
 
+**Normative note (Rev 3.5, M0 bench finding BF-1, App. H) — the step 2 presence gate is a retry
+loop, and the FIRST SPI frame after power-up is a throwaway.** The table row above states *what*
+step 2 reads, not *how the read is repeated*. The full contract for step 2:
+
+1. **Read `WHO_AM_I 0x0F` until it returns `0x3F`, up to 3 attempts.** The gate passes if **any**
+   attempt returns `0x3F` and fails only if all three fail. One `0x3F` is a positive
+   identification; retrying cannot invent `0x3F` on a genuinely dead bus, which reads the same
+   pulled-up `0xFF` (or the same `0x00`) on every attempt.
+2. **The FIRST SPI frame after power-up is NOT guaranteed and is treated as a throwaway.**
+   Measured on the bench: attempt 1 → `0xFF` (part silent), attempt 2 → `0x3F` (part present),
+   attempt 3 not executed (the loop exits on the first match). `s_spi_err_cnt = 0` for **both**
+   frames — no transfer timeout, no `SPI_SR.OVR`, no `SPI_SR.MODF`, all four signals present on the
+   scope (CS asserted, 16 clocks on SCK, MOSI, MISO). The first frame is therefore **electrically
+   clean**: the part did not answer it, which is not a bus fault.
+3. **Mechanism (most likely).** [DS §5, `Docs/DS_lis3dsh.md:249`]: **`CS` high = I²C enabled / SPI
+   idle; `CS` low = SPI active.** With `CS` high the part sits in I²C mode, so the first falling
+   `CS` edge after power-up is the moment it first registers SPI mode — and that frame can be lost.
+   After it the part answers. Recorded as a **bench finding**, not as a datasheet guarantee.
+4. **Keep a per-attempt log of the returned byte** (diagnostics). The log must distinguish "the
+   transfer produced no byte at all" (sentinel, e.g. `0xEE`) from "a byte that was not `0x3F`", so
+   silence is never later read as a wrong answer. That log is what separates *"sensor absent /
+   wiring / supply"* from *"first frame eaten"* and makes the gate a measurement, not a hope.
+5. **Failure path.** If `0x3F` is not obtained within 3 attempts, step 2 **fails**: report an
+   **initialization error** and **do not proceed** to steps 3–7. A part that never answers is not a
+   first-frame casualty, and configuring against a part that is not there yields a file full of
+   zeros, not a measurement.
+
+**Hardware note (closes the "CS external pull-up" M0 bring-up item of §2.1).** A **47 kΩ pull-up is
+now fitted on CS (PA4)**. It removes the floating-CS failure mode — an undefined CS level at
+power-up can otherwise leave the part in either interface, especially on the flying leads of §2.1
+WARN-5 — but it is **independent of** rule 2: a defined CS level does not make the part answer the
+first frame. The 3-attempt budget and the per-attempt log are kept regardless.
+
+**Scope of this note.** It governs the **power-up presence gate only**. It does not weaken the
+§3.2.6 M0 assertion (once initialization has succeeded, a polled `WHO_AM_I` read with the DMA streams
+armed must still return exactly `0x3F`) nor the §3.2.7 liveness poll: both run against an
+initialized, answering part, where a miss is a real fault.
+
+
 **BOOT-time sensor reconfiguration only (V3.5: FLAW-3 range policy + WARN-8 alias scan).** Two settings
 are chosen **before** the campaign and never changed inside a part:
 
