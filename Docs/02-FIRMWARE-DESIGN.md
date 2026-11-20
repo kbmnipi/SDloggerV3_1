@@ -28,6 +28,47 @@
 Any change to these rows is a **fact correction**, not a redesign: the PCB is frozen.
 The gate is passed on the bench, with a scope/analyzer, before BSP work is declared done (M0).
 
+**Bench toolchain for the `Debug` row (recorded 2026-11-19; facts and open items in App. H, "Bench
+equipment EQ-1…EQ-5").** The project's programmer — and the intended BOOT/IDLE telemetry receiver —
+is the **WeActStudio MiniDebugger** (`github.com/WeActStudio/WeActStudio.MiniDebugger`), an
+**APM32F103CBT6 / STM32F103CBT6** dongle that ships **two** firmwares: an **ST-Link V2.1** emulation
+and a **DAPLink** build. What that means for this row:
+
+1. **SWD is the programming path in either firmware** (SWDIO / SWCLK / GND). The build already uses
+   the plain **`swd`** upload transport rather than `hla_swd` (commit `2514b45`), which is the correct
+   posture for a V2.1 clone.
+2. **The serial side belongs to the firmware and to the wiring, not to the connector.** Measured on
+   this bench (recorded in `platformio.ini`, `[common]`): the unit enumerates as an **ST-Link** —
+   `STLINK V2J46M32 API v2`, **VID:PID `0483:3752`**, target VDD measured **3.230 V** — and flashing
+   runs through `interface/stlink.cfg` + `transport select **swd**`. ST-Link V2-style firmware *can*
+   present a virtual COM port (the Nucleo pattern), but only if the UART middleware is inside the
+   flashed image **and** the TX/RX pins are actually routed on the port; nothing in the vendor repo
+   proves either — it ships **no USB-UART-bridge driver** (only `Drivers/STLink/stsw-link007-…`,
+   `Drivers/STLink/stsw-link009.zip`, `Drivers/DAPLink/CMSIS_DAP_…`), the port map exists only as a
+   picture (`Images/2.png`), and `Doc/WeAct-MiniDebugger_V10_SchDoc.pdf` is a raster image with **no
+   text layer**. **`[TODO: verify against bench]`** — look for a second CDC interface ("ST-Link
+   Virtual COM Port") while the dongle is in ST-Link mode, and identify which port pin is TX / RX.
+   Until that is measured, the PA9/PA10 link is proven with a scope or a known-good second adapter,
+   never assumed. **Decision item:** reflashing the dongle to `DAPLink` to obtain a COM port would
+   invalidate the pinned flashing path (`upload_protocol = stlink` + `interface/stlink.cfg`) and force
+   a CMSIS-DAP configuration instead — see App. H **EQ-6**. The safe default is **ST-Link mode for
+   programming, a separate 3.3 V USB-UART adapter for telemetry**: two tools, neither of which can
+   break the other.
+3. **Wiring contract:** PA9 = **USART1_TX → the adapter's RX**, PA10 = **USART1_RX ← the adapter's
+   TX**, and **one common GND**. Levels are **3.3 V** on our side (push-pull); a level mismatch is a
+   hardware defect, not something firmware may compensate. **`[TODO: measure]`** the far end's logic
+   level — a 5 V driver into PA10 violates the pin contract.
+4. **No hardware flow control.** This row specifies **115200 8N1, three wires**. A USB-CDC virtual COM
+   has no CTS/RTS and buffers outside our control, so the telemetry budget is bounded by this row's
+   state gate — **BOOT/IDLE only, forbidden in `RECORDING`/`ROTATING`** — and not by the adapter's
+   FIFO depth.
+5. **What this toolchain unlocks:** the §10.2.1 **P2** evidence ("`HAL_GetVersion()` printed at BOOT")
+   and the per-attempt diagnostic logs that today can only be read over SWD (App. H, **BF-1**). It
+   does **not** replace the scope obligations of this row: the **`cs_high_floor_ns`** sweep, the
+   **INT1 idle/active level and pulse width** ([DS E8]) and the DMA2 loopback remain scope work. The
+   **47 kΩ CS pull-up** is fitted (BF-1) [corrected 2026-11-20: owner-measured fitted value is 33 kΩ, not 47 kΩ. Electrically equivalent for this purpose: 3.3 V / 33 kΩ ≈ 100 µA with CS low (negligible vs §6.1), and a stronger hold than 47 kΩ on flying leads. No conclusion depends on the value: the BF-1 re-test showed the pull-up does not change first-frame behaviour, and BUG-1's mechanism is the MCU-side SPE 0→1 edge under low CS.]; the **1 kΩ + 1 nF INT1 RC** requested by FLAW-6 is **not
+   yet fitted**.
+
 ### 2.2 Clock tree (constant)
 
 ```
@@ -135,7 +176,7 @@ step 2 reads, not *how the read is repeated*. The full contract for step 2:
    zeros, not a measurement.
 
 **Hardware note (closes the "CS external pull-up" M0 bring-up item of §2.1).** A **47 kΩ pull-up is
-now fitted on CS (PA4)**. It removes the floating-CS failure mode — an undefined CS level at
+now fitted on CS (PA4)** [corrected 2026-11-20: owner-measured fitted value is 33 kΩ, not 47 kΩ. Electrically equivalent for this purpose: 3.3 V / 33 kΩ ≈ 100 µA with CS low (negligible vs §6.1), and a stronger hold than 47 kΩ on flying leads. No conclusion depends on the value: the BF-1 re-test showed the pull-up does not change first-frame behaviour, and BUG-1's mechanism is the MCU-side SPE 0→1 edge under low CS.]. It removes the floating-CS failure mode — an undefined CS level at
 power-up can otherwise leave the part in either interface, especially on the flying leads of §2.1
 WARN-5 — but it is **independent of** rule 2: a defined CS level does not make the part answer the
 first frame. The 3-attempt budget and the per-attempt log are kept regardless.

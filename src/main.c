@@ -346,7 +346,7 @@ int main(void)
      *     2) The interface is selected by CS itself: [DS §5] — "CS high = I2C
      *        enabled / SPI idle, CS low = SPI active" — so the first CS-low
      *        edge can be consumed by the interface-mode switch itself. The
-     *        47 kΩ CS pull-up (§2.1's MANDATORY M0 item) IS now fitted, and the
+     *        33 kΩ CS pull-up (§2.1's MANDATORY M0 item) IS now fitted, and the
      *        re-test with it in place returned the same log (0xFF, then 0x3F,
      *        s_spi_err_cnt = 0): the pull-up removes the floating-CS risk, it
      *        does not remove the throwaway first frame — finding BF-1,
