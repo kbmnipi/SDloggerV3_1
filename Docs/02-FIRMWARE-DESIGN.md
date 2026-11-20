@@ -924,6 +924,8 @@ text is just no longer padded with endurance-run tables).
 Budget check: L1 (1.5 s) + clean-stop (1.0 s) = 2.5 s against 5.45 s worst case → **>2× margin**.
 *(V3.4: the L2 rung no longer performs a truncation pass, so its budget is tighter, not looser.)*
 
+*(M0 step 5, implemented 2026-11-20: with the IWDG armed, `app_error_halt()` — diagnosed and deliberately **non**-feeding — no longer halts forever but terminates in an IWDG reset; the next boot decodes the cause from `RCC_CSR` (IWDG/BOR) before software writes `RMVF`, stores it, and announces **LED 8**, and bench access to a chip sitting in that halt is connect-under-reset via NRST. **Feed conditions unchanged** — this is a consequence of arming the watchdog, not a new feed rule, and the halt still proves no progress, which is exactly why it is allowed to expire.)*
+
 ### 5.2 "SDIO returns early": DAT0 busy and the timeout budget
 
 `HAL_SD_WriteBlocks_DMA` completes its DMA event **while the card is still programming and holding
