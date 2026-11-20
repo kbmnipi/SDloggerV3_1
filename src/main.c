@@ -15,7 +15,12 @@
  *   HAL_RCC_ClockConfig(), so a wrong clock changes the blink rate.
  *
  * WHAT IT DELIBERATELY DOES NOT DO.
- *   No SDIO, no FatFs, no ring buffer, no TIM2, no IWDG, no RTC, no ADC1
+ *   TIM2 (§2.2: 1 MHz free-run + 1 kHz supervisor tick, src/bsp_tim2.c) and the
+ *   IWDG (§5.1: 8 s nominal / 5.45 s floor, fed only from the 1 Hz
+ *   proven-progress tick, src/bsp_iwdg.c) exist as of this step, and the reset
+ *   cause is captured before anything can clear it (§5.1 "a reset is never
+ *   silent") and announced as §8's LED code 8.
+ *   No SDIO, no FatFs, no ring buffer, no RTC, no ADC1, no KEY
  *   (§10.2 order). No RTOS, no malloc/new, no dynamic allocation (§2.3 rule 4).
  *   SPI1 exists, but only as the §3.1 step 2 presence gate in drv_lis3dsh.c:
  *   polled PIO, no DMA armed, and ODR never started, so the sensor stays in
@@ -30,6 +35,10 @@
  *   passed, and N (1..3) is the attempt on which WHO_AM_I first read 0x3F: the
  *   gate is a 3-attempt OR (see the block in main and LIS3DSH_GATE_ATTEMPTS).
  *   Two blinks therefore mean "the part only answers from the second frame".
+ *   8 fast blinks BEFORE those N happen only when the previous session ended in
+ *   an IWDG or BOR reset (§5.1's last row, §8 code 8): after a diagnosed halt
+ *   the sequence is "8, then 1, then heartbeat", and 8 is never a gate result
+ *   because the gate cannot report more than LIS3DSH_GATE_ATTEMPTS (3).
  *   The §2.1/§2.2 verification gate itself is closed with a scope on the bus
  *   pins (or MCO), not by eyeballing the LED.
  ******************************************************************************
@@ -37,6 +46,8 @@
 
 #include "stm32f4xx_hal.h" /* framework = stm32cube; the builder defines USE_HAL_DRIVER */
 #include "drv_lis3dsh.h"   /* §3.1 step 2 presence gate: SPI1 + WHO_AM_I (src/drv_lis3dsh.c) */
+#include "bsp_tim2.h"      /* §2.2 supervisor time base: 1 MHz free-run + 1 kHz tick (src/bsp_tim2.c) */
+#include "bsp_iwdg.h"      /* §5.1 IWDG 8 s + reset cause; §8 LED 8 (src/bsp_iwdg.c) */
 
 /* ========================================================================== */
 /* §2.2 PLL constants — transcribed from the frozen clock tree, not chosen.   */
@@ -82,8 +93,23 @@
 
 /* Heartbeat half-period: 500 ms ON + 500 ms OFF = 1 Hz (§10.2 M0 "LED codes
  * readable"). HAL_Delay is legal ONLY in this thread: SysTick is the lowest
- * priority exception and there is no ISR here yet (§2.3 rule 3). */
+ * priority exception, so HAL_Delay stays correct here (§2.3 rule 3). TIM2 now
+ * exists at preempt 7 (§3.2.5) and can preempt both this loop and the SysTick
+ * tick — but its ISR calls no HAL and reads no tick state (src/bsp_tim2.c), so
+ * uwTick still advances and HAL_Delay's wait is only lengthened by ≤ 0.5 µs. */
 #define HEARTBEAT_HALF_PERIOD_MS  500U
+
+/* --------------------------------------------------------------------------
+ * §8 LED code 8: "previous session ended by IWDG/BOR reset". The count IS the
+ * code — it is the strategy's number, not a choice — and reusing
+ * app_blink_pass() keeps the rhythm identical to the presence gate's announce,
+ * so the two are told apart by count alone: the gate can never emit more than
+ * LIS3DSH_GATE_ATTEMPTS (3), and 8 has no other meaning while the state machine
+ * of step 17 does not exist yet.
+ * TODO (step 17): replace with the §8 pattern proper — N short pulses every 4 s
+ * at ≤ 0.5 % duty — once the state machine owns LED timing.
+ * -------------------------------------------------------------------------- */
+#define RESET_CAUSE_BLINK_COUNT   8U
 
 /* --------------------------------------------------------------------------
  * §3.1 step 2 presence gate: attempt budget and bench encoding.
@@ -273,7 +299,24 @@ static void app_error_halt(void)
     __disable_irq();
     for (;;)
     {
-        /* No IWDG yet (step 5): nothing can rescue this loop except a debugger.
+        /* IWDG-ARMED CONSEQUENCE (step 5; the halt code below it is deliberately
+           UNCHANGED — nothing here feeds the watchdog, and that is the point).
+           §5.1's feed is "proven progress", and a diagnosed bring-up gate failure
+           has none to prove: this loop spins forever without feeding, so the halt
+           now ENDS IN AN IWDG RESET in ≤ 5.45 s (8.00 s nominal). Masking
+           interrupts cannot postpone it — the IWDG counts from its own LSI and
+           PRIMASK is not in its path, which is what makes this halt survivable
+           on a deployed logger with no debugger attached. What the bench sees:
+           LED solid ON for one window, then the next boot announcing §8's code 8
+           (bsp_reset_cause_init() latched BSP_RST_CAUSE_IWDG before anything
+           could clear it) and the 1 Hz heartbeat — i.e. the failure is reported
+           instead of swallowing the board, per §5.1 "a reset is never silent".
+           Inspecting the chip DURING the halt uses connect-under-reset via NRST
+           (App. H "Bench debug topology" in Docs/90-DECISIONS-LOG.md), which is
+           why NRST is wired at all. TODO (step 17): replace the solid-ON signal
+           with the §5/§8 error code and the Backup-SRAM journal entry.
+           One property of this loop is load-bearing and is restated here so that a later
+           edit cannot lose the reason for the shape it has:
            Deliberately not HAL_Delay-based — SysTick cannot be trusted here. */
     }
 }
@@ -304,14 +347,27 @@ void SysTick_Handler(void)
 }
 
 /**
- * @brief  Entry point: HAL init -> LED init -> 84 MHz clock -> 1 Hz heartbeat.
+ * @brief  Entry point: reset cause -> HAL -> LED -> 84 MHz -> TIM2 -> IWDG ->
+ *         BOOT announcements -> 1 Hz heartbeat fed at 1 Hz.
  * @return never returns.
  * @note   The super-loop is the single consumer context of the whole firmware
  *         (§2.3 "one super-loop consumer plus event-driven producers"). At step
- *         2 there is no producer yet, so the loop holds only the heartbeat.
+ *         2 there is no producer yet, so the loop holds only two things: the
+ *         heartbeat and the §5.1 watchdog feed. Both belong to this context by
+ *         rule and not by convenience — §5.1: "Who feeds | consumer only
+ *         (super-loop) | feeding from an ISR turns the watchdog into
+ *         decoration" — and the only progress signal in existence is TIM2's
+ *         1 Hz supervisor flag.
  */
 int main(void)
 {
+    /* §5.1 "a reset is never silent" — FIRST statement of the program, ahead of
+       HAL_Init() and of every clock write. RCC_CSR's reset flags are sticky:
+       only a POR/PIN reset or a software write of RMVF clears them, and HAL's
+       clock-unwind paths are allowed to do the latter, so the capture has to
+       happen before anything that could. Reads RCC->CSR and nothing else. */
+    bsp_reset_cause_init();
+
     /* HAL_Init(): SysTick at 1 ms on the post-reset clock (HSI 16 MHz), NVIC
        priority grouping, and the weak/empty HAL_MspInit() hook. */
     HAL_Init();
@@ -321,6 +377,51 @@ int main(void)
 
     /* §2.2: SYSCLK 84 MHz, PLL48CK 48 MHz, AHB 84 / APB1 42 / APB2 84, 2 WS. */
     SystemClock_Config();
+
+    /* ======================================================================
+     * §2.2 supervisor, then §5.1 watchdog — the order is a dependency, not a
+     * preference. §5.1's feed condition is "a live 1 Hz state tick", and that
+     * tick is produced by bsp_tim2_init(); arming the IWDG first would leave
+     * the boot path running with a watchdog armed and no progress signal with
+     * which to satisfy it. Both are BOOT-only configurations and neither is
+     * repeated: TIM2's placement rule is "configuration only in BOOT"
+     * (Docs/00-ARCHITECTURE.md:186), and an IWDG cannot be stopped once started.
+     * ==================================================================== */
+    bsp_tim2_init();       /* 1 MHz free-run, 1 kHz tick, 10 ms + 1 Hz flags */
+    bsp_iwdg_init();       /* window starts counting the instant this returns */
+
+    /* ----------------------------------------------------------------------
+     * §8 code 8: "previous session ended by IWDG/BOR reset" — §5.1's last row
+     * ("a reset is never silent; LED 8 on the next boot"), announced once per
+     * boot BEFORE the presence gate. Absorbed by the state machine at step 17,
+     * which will own all LED timing; here it is a boot-time echo.
+     *
+     * WHY IT CANNOT BE CONFUSED WITH THE GATE'S ANNOUNCE: both use
+     * app_blink_pass()'s 80 ms rhythm, and the count is the whole message — the
+     * gate emits 1..LIS3DSH_GATE_ATTEMPTS (3) at most, so 8 pulses has exactly
+     * one reading in §8's list.
+     *
+     * THE BOOT BUDGET IT HAS TO FIT (§5.1's 5.45 s fast-LSI floor, since
+     * HAL_IWDG_Init() above already reloaded the counter with 1000):
+     *   this announce, 8 x (80+80) + 1000 pause ......... 2280 ms
+     *   presence gate, 3 x 10 ms timeout + 2 x 10 ms gap    50 ms
+     *   gate pass blink at N = 3: 3 x 160 + 1000          1480 ms
+     *   first super-loop iteration: feeds immediately — the 1 Hz flag was
+     *                                 latched at t = 1000 ms and no one has
+     *                                 taken it yet, so there is no wait
+     *   ------------------------------------------------------------
+     *   worst case ≈ 3.81 s  → ≈ 1.64 s (30 % of the window) still unspent at
+     *   the 5.45 s floor, and > 4 s against the 8.00 s nominal.
+     * A gate that never passes instead halts at ≈ 2.35 s without feeding and is
+     * reset at 5.45…8.00 s, and the cycle repeats with this announce at its
+     * head — which is the observable §5.1 loop this step exists to create.
+     * TODO: verify against bench (HAL_Delay is 1 ms-tick quantised and the SPI
+     * timeout is measured start-to-finish, so the real total is a measurement).
+     * ---------------------------------------------------------------------- */
+    if ((bsp_reset_cause_get() & (BSP_RST_CAUSE_IWDG | BSP_RST_CAUSE_BOR)) != 0U)
+    {
+        app_blink_pass(RESET_CAUSE_BLINK_COUNT);   /* §8 code 8, once per boot */
+    }
 
     /* ======================================================================
      * §3.1 step 2 — LIS3DSH presence gate over SPI1 (§2.1 wiring, [DS §5.2]
@@ -418,6 +519,34 @@ int main(void)
 
     for (;;)
     {
+        /* §5.1 FEED, mapped to the policy table line by line:
+           "Who feeds | consumer only (super-loop)"        → this is that loop;
+           "Feed condition | ... or a live 1 Hz state tick in IDLE/ERROR/L3" →
+           bsp_tim2_take_1hz_flag() IS that tick (TIM2 CH1 compare, §2.2), and
+           taking it is the proof of progress. The other feed conditions
+           (≥1 block committed; a completed recovery/rotation/scan sub-step) do
+           not exist yet — no filesystem, no ring, no ladder.
+           CHECK BEFORE WORK, not after: the feed is attempted at the top of each
+           iteration, so the loop can never start a 500 ms delay without having
+           had its chance to feed first.
+           REAL MARGIN — and it is not the 500 ms of the loop body. The feed is
+           gated by a flag that is set once per 1000 ms, so the loop's ~500 ms
+           period is the POLL rate, while the FEED rate is 1 Hz: consecutive
+           feeds are ≈ 1000 ms apart typically, and the worst-case phase
+           relationship (a take that just misses a set, then the full 500 ms
+           delay, then the take that finds it) puts the bound at ≈ 1500 ms.
+           Against the 5.45 s fast-LSI floor that is 3.6x, and against the 8.00 s
+           nominal 5.3x — above the >2x that §5.1's own budget line demands, and
+           it is the number to compare, not the loop period. Tightening it would
+           mean feeding on a faster flag, which §5.1 explicitly does not want:
+           progress, not "the loop is spinning". From step 17 the state machine
+           owns this call site, adds block commits, and applies the ≤ 1 feed per
+           500 ms long-operation rule to f_expand / SD re-init / RESCUE. */
+        if (bsp_tim2_take_1hz_flag() != 0U)
+        {
+            bsp_iwdg_feed();   /* consumer context, proven progress (§5.1) */
+        }
+
         HAL_GPIO_TogglePin(STATUS_LED_PORT, STATUS_LED_PIN);  /* PB2 toggle (§2.1) */
         HAL_Delay(HEARTBEAT_HALF_PERIOD_MS);                  /* 500 ms high + 500 ms low = 1 Hz */
     }
