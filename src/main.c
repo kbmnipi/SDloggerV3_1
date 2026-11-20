@@ -48,6 +48,7 @@
 #include "drv_lis3dsh.h"   /* §3.1 step 2 presence gate: SPI1 + WHO_AM_I (src/drv_lis3dsh.c) */
 #include "bsp_tim2.h"      /* §2.2 supervisor time base: 1 MHz free-run + 1 kHz tick (src/bsp_tim2.c) */
 #include "bsp_iwdg.h"      /* §5.1 IWDG 8 s + reset cause; §8 LED 8 (src/bsp_iwdg.c) */
+#include "bsp_rtc.h"       /* §7 RTC: two-phase LSE bring-up, 127/255 prescaler, §7.1 reader, §7.3 gate (src/bsp_rtc.c) */
 
 /* ========================================================================== */
 /* §2.2 PLL constants — transcribed from the frozen clock tree, not chosen.   */
@@ -390,6 +391,21 @@ int main(void)
     bsp_tim2_init();       /* 1 MHz free-run, 1 kHz tick, 10 ms + 1 Hz flags */
     bsp_iwdg_init();       /* window starts counting the instant this returns */
 
+    /* §7 phase 1 — the LSE is started here and nowhere else in the boot path.
+       The position is a budget decision, not a preference: an 8 MHz crystal-class
+       oscillator takes hundreds of ms to seconds to reach LSERDY, and placing the
+       ENABLE here lets that time overlap the §8 announce and the §3.1 presence
+       gate below (up to ~2.3 s of work that already exists) instead of becoming a
+       wait at the end of the path. bsp_rtc_lse_start() itself returns in
+       microseconds. §5.1: "a blocking LSE wait in the boot path" is what is
+       forbidden, and this call is not one.
+       Order note: it is after SystemClock_Config() because the backup-domain
+       access needs the PWR clock, and after bsp_iwdg_init() because the watchdog's
+       own LSI (§2.2: LSI belongs to the IWDG, never to the RTC) is now armed and
+       visible, so a later BDCR read cannot be confused by an unstabilised IWDG
+       clock. */
+    bsp_rtc_lse_start();
+
     /* ----------------------------------------------------------------------
      * §8 code 8: "previous session ended by IWDG/BOR reset" — §5.1's last row
      * ("a reset is never silent; LED 8 on the next boot"), announced once per
@@ -409,9 +425,17 @@ int main(void)
      *   first super-loop iteration: feeds immediately — the 1 Hz flag was
      *                                 latched at t = 1000 ms and no one has
      *                                 taken it yet, so there is no wait
+     *   RTC phase 2 (bsp_rtc_init) LSE poll:            ≤ 500 ms, and only if the
+     *                                 LSE is slow or absent. Bench-measured
+     *                                 announce+gate = 3.43–3.50 s (Test C), so the
+     *                                 realistic end of this range is ≈ 4.00 s and
+     *                                 the paper worst case below is 4.31 s.
      *   ------------------------------------------------------------
-     *   worst case ≈ 3.81 s  → ≈ 1.64 s (30 % of the window) still unspent at
-     *   the 5.45 s floor, and > 4 s against the 8.00 s nominal.
+     *   worst case ≈ 3.81 s + ≤ 0.50 s = ≤ 4.31 s  →  ≥ 1.14 s (≈ 21 % of the
+     *   window) still unspent at the 5.45 s floor, and ≥ 3.7 s against the 8.00 s
+     *   nominal. The unspent remainder is the number step 6 changed; it was
+     *   ≈ 1.64 s before the RTC was added, and §5.1's ">2x margin against the feed
+     *   interval" is untouched because the first feed still happens immediately.
      * A gate that never passes instead halts at ≈ 2.35 s without feeding and is
      * reset at 5.45…8.00 s, and the cycle repeats with this announce at its
      * head — which is the observable §5.1 loop this step exists to create.
@@ -516,6 +540,48 @@ int main(void)
     }
 
     app_blink_pass(pass_attempt);   /* N blinks = the N-th attempt answered */
+
+    /* ======================================================================
+     * §7 phase 2 + §7.3 boot validity gate — the last thing the boot path does
+     * before the super-loop, and deliberately last: the LSE has by now had the
+     * whole announce+gate window (~2.3 s) to stabilise, so the bounded poll below
+     * is normally one register read rather than a wait.
+     *
+     * WHY THE GATE IS A STATE AND NOT A FAILURE HERE. §7.3's answer to an invalid
+     * clock is its fallback chain (manifest's last anchor UTC, Backup-SRAM
+     * last_utc behind its CRC, else 0, clock_valid=0 in the HEADER,
+     * CLOCK_INVALID in every block header, LED 7) — all of it app/logcore, and all
+     * of it not built yet. So step 6 records the answer and moves on: no halt, no
+     * retry, no LED. Feeding the watchdog stays the loop's business (§5.1).
+     *
+     * WHAT THE BENCH EXPECTS, and it is a decision tree rather than a hope:
+     *   LSE fitted and healthy   -> s_lse_startup_ms small (0..tens of ms, because
+     *                               phase 1 started it ~2.3 s ago), RTC_PRER reads
+     *                               0x007F00FF, and s_rtc_gate == 0 anyway on a
+     *                               board with no VBAT: RTC_BKP0R holds no magic and
+     *                               the calendar was never programmed. That INVALID
+     *                               is §7.3's declared branch, not a fault.
+     *   LSE absent               -> s_lse_startup_ms == 0xFFFFFFFF after ≤ 500 ms,
+     *                               RTCSEL/RTCEN left at 0, s_rtc_gate == 0.
+     *   RTCSEL foreign (LSI etc.) -> bsp_rtc_init() refuses, RCC_BDCR (0x40002370)
+     *                               shows it, §2.2 violated by someone else.
+     * SWD evidence set: s_rtc_gate, s_rtc_now_ms, s_lse_startup_ms, s_rtc_torn_cnt,
+     * plus the registers themselves — RCC_BDCR 0x40002370, RTC_ISR 0x4000280C,
+     * RTC_PRER 0x40002810, RTC_BKP0R 0x40002850.
+     * bsp_rtc_set_utc_ms() is NOT called here on purpose: it may wait 2 s, which
+     * this budget cannot pay, and it belongs to whoever owns the fallback chain or
+     * to a host "set time" command once the filesystem exists.
+     * ==================================================================== */
+    bsp_rtc_init();
+
+    if (bsp_rtc_gate() != 0U)
+    {
+        /* Only read the clock when the gate says the clock is worth reading. The
+           result lands in s_rtc_now_ms; nothing consumes it yet because there is no
+           block header to stamp and no manifest to commit (§7.1's t_latch_ms is
+           producer work, step 9+). */
+        (void)bsp_rtc_now_ms();
+    }
 
     for (;;)
     {
